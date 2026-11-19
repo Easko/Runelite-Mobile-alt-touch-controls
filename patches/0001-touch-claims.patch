@@ -1,0 +1,206 @@
+From 89a356c41a0967c1de7c6b240bf3b8326dfa05ef Mon Sep 17 00:00:00 2001
+From: Touch Keys tester <touchtest@localhost>
+Date: Thu, 19 Nov 2026 10:00:29 +0000
+Subject: [PATCH 1/2] Let plugins claim a touch on the game canvas
+
+---
+ .../kotlin/net/runelite/mp/AppAndroid.kt      | 179 ++++++++++++++++++
+ 1 file changed, 179 insertions(+)
+
+diff --git a/android/src/androidMain/kotlin/net/runelite/mp/AppAndroid.kt b/android/src/androidMain/kotlin/net/runelite/mp/AppAndroid.kt
+index ef873a3..3f3c31c 100644
+--- a/android/src/androidMain/kotlin/net/runelite/mp/AppAndroid.kt
++++ b/android/src/androidMain/kotlin/net/runelite/mp/AppAndroid.kt
+@@ -411,6 +411,75 @@ private fun GameViewport(modifier: Modifier = Modifier) {
+                     // Mouse and touchpad presses belong to MouseBridge; awaitEachGesture then
+                     // waits for every pointer to come up before looking for the next touch.
+                     if (pointerKind(currentEvent) != PointerKind.Touch) return@awaitEachGesture
++                    // Offer the touch to RuneLite's mouse listeners before deciding on a
++                    // gesture. A plugin that consumes the press owns the touch until lift:
++                    // it gets the drags and the release, and no tap, long-press or camera
++                    // drag reaches the game.
++                    val claim = tryPluginClaim(down.position, boxSize)
++                    if (claim != null) {
++                        down.consume()
++                        // Other fingers keep working while the claimed one is down: a quick
++                        // tap from a second finger is a normal left click on the game, so a
++                        // held Shift bubble plus a tap on an item drops it, as on desktop, and
++                        // a second finger dragging is a normal drag (camera over the scene).
++                        val otherDown = HashMap<androidx.compose.ui.input.pointer.PointerId, Pair<Offset, Long>>()
++                        val otherMoved = HashSet<androidx.compose.ui.input.pointer.PointerId>()
++                        var claimedUp = false
++                        var otherDrag: DragSession? = null
++                        var otherDragId: androidx.compose.ui.input.pointer.PointerId? = null
++                        try {
++                            while (true) {
++                                val ev = awaitPointerEvent(PointerEventPass.Main)
++                                for (o in ev.changes) {
++                                    if (o.id == down.id) continue
++                                    if (o.pressed && !o.previousPressed) {
++                                        otherDown[o.id] = o.position to System.currentTimeMillis()
++                                    } else if (o.pressed) {
++                                        val start = otherDown[o.id]
++                                        if (o.id == otherDragId) {
++                                            otherDrag?.update(o.position, boxSize)
++                                        } else if (start != null && o.id !in otherMoved &&
++                                            (o.position - start.first).getDistance() > viewConfiguration.touchSlop) {
++                                            otherMoved += o.id
++                                            // One drag at a time, like the normal one-finger path.
++                                            if (otherDrag == null) {
++                                                otherDrag = beginDrag(start.first, o.position, boxSize,
++                                                    System.currentTimeMillis() - start.second)
++                                                if (otherDrag != null) otherDragId = o.id
++                                            }
++                                        }
++                                    } else if (o.previousPressed) {
++                                        if (o.id == otherDragId) {
++                                            otherDrag?.end()
++                                            otherDrag = null
++                                            otherDragId = null
++                                        }
++                                        val start = otherDown.remove(o.id)
++                                        val quick = start != null &&
++                                            System.currentTimeMillis() - start.second < viewConfiguration.longPressTimeoutMillis
++                                        if (quick && o.id !in otherMoved) dispatchClick(start!!.first, boxSize, BUTTON1)
++                                        otherMoved -= o.id
++                                    }
++                                }
++                                val c = ev.changes.firstOrNull { it.id == down.id }
++                                ev.changes.forEach { it.consume() }
++                                if (!claimedUp) {
++                                    if (c == null || c.changedToUpIgnoreConsumed() || !c.pressed) {
++                                        claimedUp = true
++                                        claim.release()
++                                    } else {
++                                        claim.drag(c.position, boxSize)
++                                    }
++                                }
++                                // The gesture ends once every finger is up.
++                                if (ev.changes.none { it.pressed }) break
++                            }
++                        } finally {
++                            otherDrag?.end()
++                            if (!claimedUp) claim.release()
++                        }
++                        return@awaitEachGesture
++                    }
+                     val downId = down.id
+                     val downTime = System.currentTimeMillis()
+                     var lastPos: Offset = down.position
+@@ -1748,3 +1817,113 @@ private class MouseBridge {
+         private const val MULTI_CLICK_MS = 500L
+     }
+ }
++
++
++// ---------------------------------------------------------------------------------------
++// Plugin touch claims: a finger-down on the game is offered to RuneLite's MouseManager
++// listeners (never the game) as a BUTTON1 press. When a listener consumes it, that touch
++// belongs to the plugin: drags and the lift go to MouseManager too, so the plugin sees the
++// finger land and lift in real time (hold-style on-screen keys need this).
++// ---------------------------------------------------------------------------------------
++
++private fun tryPluginClaim(pos: Offset, boxSize: IntSize): PluginTouchClaim? {
++    return try {
++        val window = java.awt.Window.primaryFrame() ?: return null
++        val (winX, winY) = composeToWindow(pos, boxSize, window) ?: return null
++        val hit = hitTest(window, winX, winY) ?: return null
++        val canvas = ancestorChain(hit.comp).firstOrNull { it is java.awt.Canvas } as? java.awt.Canvas
++            ?: return null
++        val origin = hitTestExact(window, canvas) ?: return null
++        val manager = net.runelite.mp.ui.bridge.RuneLiteAccess.instance(
++            net.runelite.client.input.MouseManager::class.java) ?: return null
++        val claim = PluginTouchClaim(window, canvas, origin.absX, origin.absY, manager)
++        if (claim.press(winX - origin.absX, winY - origin.absY)) claim else null
++    } catch (t: Throwable) {
++        android.util.Log.w("PluginTouchClaim", "claim probe failed", t)
++        null
++    }
++}
++
++private class PluginTouchClaim(
++    private val window: java.awt.Window,
++    private val canvas: java.awt.Canvas,
++    private val originX: Int,
++    private val originY: Int,
++    private val manager: net.runelite.client.input.MouseManager,
++) {
++    private var x = 0 // touch thread only
++    private var y = 0
++
++    /**
++     * Offers the press to RuneLite's mouse listeners on the EDT and waits for the answer, but
++     * never longer than [PROBE_TIMEOUT_MS]: a busy EDT must not hold up every touch. If the
++     * answer comes late, the touch is handled as an ordinary gesture, and a late claim gets
++     * its release straight away so the plugin is never left holding a press.
++     */
++    fun press(lx: Int, ly: Int): Boolean {
++        x = lx; y = ly
++        val pressed = event(java.awt.event.MouseEvent.MOUSE_PRESSED, java.awt.event.InputEvent.BUTTON1_DOWN_MASK, lx, ly)
++        val lateRelease = event(java.awt.event.MouseEvent.MOUSE_RELEASED, 0, lx, ly)
++        val lateClick = event(java.awt.event.MouseEvent.MOUSE_CLICKED, 0, lx, ly)
++        val lock = Any()
++        var answered = false
++        var consumed = false
++        var abandoned = false
++        val done = java.util.concurrent.CountDownLatch(1)
++        java.awt.EventQueue.invokeLater {
++            val claimed = try {
++                manager.processMousePressed(pressed).isConsumed
++            } catch (t: Throwable) {
++                android.util.Log.w("PluginTouchClaim", "press failed", t)
++                false
++            }
++            synchronized(lock) {
++                answered = true
++                consumed = claimed
++                if (abandoned && claimed) {
++                    manager.processMouseReleased(lateRelease)
++                    manager.processMouseClicked(lateClick)
++                }
++            }
++            done.countDown()
++        }
++        done.await(PROBE_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
++        synchronized(lock) {
++            if (answered) return consumed
++            abandoned = true
++        }
++        android.util.Log.i("PluginTouchClaim", "EDT busy for ${PROBE_TIMEOUT_MS}ms; touch handled normally")
++        return false
++    }
++
++    /** Fire-and-forget: the EDT runs events in order, so drags and the release stay in sequence. */
++    fun drag(pos: Offset, boxSize: IntSize) {
++        val (wx, wy) = composeToWindow(pos, boxSize, window, clamp = true) ?: return
++        x = wx - originX; y = wy - originY
++        val e = event(java.awt.event.MouseEvent.MOUSE_DRAGGED, java.awt.event.InputEvent.BUTTON1_DOWN_MASK, x, y)
++        java.awt.EventQueue.invokeLater { manager.processMouseDragged(e) }
++    }
++
++    fun release() {
++        val released = event(java.awt.event.MouseEvent.MOUSE_RELEASED, 0, x, y)
++        val clicked = event(java.awt.event.MouseEvent.MOUSE_CLICKED, 0, x, y)
++        java.awt.EventQueue.invokeLater {
++            manager.processMouseReleased(released)
++            manager.processMouseClicked(clicked)
++        }
++    }
++
++    private fun event(id: Int, mods: Int, ex: Int, ey: Int): java.awt.event.MouseEvent {
++        val dragged = id == java.awt.event.MouseEvent.MOUSE_DRAGGED
++        return java.awt.event.MouseEvent(
++            canvas, id, System.currentTimeMillis(), mods, ex, ey,
++            if (dragged) 0 else 1, false,
++            if (dragged) java.awt.event.MouseEvent.NOBUTTON else java.awt.event.MouseEvent.BUTTON1,
++        )
++    }
++
++    companion object {
++        /** About three frames at 60 Hz. Past this, a touch goes the normal way. */
++        const val PROBE_TIMEOUT_MS = 50L
++    }
++}
+-- 
+2.43.0
+

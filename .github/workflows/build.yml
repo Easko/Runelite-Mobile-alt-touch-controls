@@ -1,0 +1,196 @@
+name: Build touch test
+
+# Checks for a new RuneLite Mobile release, applies the patches in patches/ to it,
+# builds "RuneLite Touch Test" and publishes it as a release of this repository.
+# The test app's in-app updater is pointed at this repository, so phones get it too.
+
+on:
+  schedule:
+    - cron: "41 */6 * * *" # every 6 hours
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild even if this version was already released"
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - "patches/**"
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: build-touch-test
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: zeruth/runelite-android
+  GRADLE_OPTS: "-Dfile.encoding=UTF-8"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+        with:
+          path: patcher
+
+      - name: Find the latest RuneLite Mobile release
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          TAG=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)
+          test -n "$TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            # Scheduled runs only build new versions. A manual run with "force", or a
+            # change to the patches, rebuilds and replaces the APK of the same version.
+            if [ "$EVENT" = "schedule" ] || { [ "$EVENT" = "workflow_dispatch" ] && [ "$FORCE" != "true" ]; }; then
+              echo "Release $TAG is already built; nothing to do."
+              echo "build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "build=true" >> "$GITHUB_OUTPUT"
+          echo "Building touch test for $TAG"
+
+      - name: Check out RuneLite Mobile ${{ steps.upstream.outputs.tag }}
+        if: steps.upstream.outputs.build == 'true'
+        run: git clone --depth 1 --branch "${{ steps.upstream.outputs.tag }}" "https://github.com/$UPSTREAM" upstream
+
+      - name: Apply patches
+        id: patch
+        if: steps.upstream.outputs.build == 'true'
+        working-directory: upstream
+        run: |
+          git -c user.name="touch-test" -c user.email="touch-test@localhost" am --3way ../patcher/patches/*.patch
+          # Point the in-app update check at this repository's releases. The splash screen's
+          # contributor credits keep reading the official repository.
+          UPDATER=android/src/androidMain/kotlin/net/runelite/mp/update/UpdateChecker.kt
+          sed -i "s|get(\"\$API/releases/latest\")|get(\"https://api.github.com/repos/$GITHUB_REPOSITORY/releases/latest\")|" "$UPDATER"
+          grep -q "repos/$GITHUB_REPOSITORY/releases/latest" "$UPDATER"
+
+      - name: Report patches that no longer apply
+        if: failure() && steps.patch.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          TITLE="Patches don't apply to $TAG"
+          if [ -z "$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "in:title \"$TITLE\"" --json number --jq '.[].number')" ]; then
+            gh issue create -R "$GITHUB_REPOSITORY" --title "$TITLE" --body "RuneLite Mobile $TAG changed code that the patches in \`patches/\` touch, so they need updating before a touch test build can be made for it. Run log: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          fi
+
+      - name: Set up JDK 17
+        if: steps.upstream.outputs.build == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle
+        if: steps.upstream.outputs.build == 'true'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: wrapper
+          build-root-directory: upstream
+
+      - name: Install Android NDKs
+        if: steps.upstream.outputs.build == 'true'
+        working-directory: upstream
+        run: |
+          for f in android/build.gradle.kts android-awt/build.gradle.kts; do
+            V=$(sed -n 's/^\s*ndkVersion\s*=\s*"\(.*\)"/\1/p' "$f" | head -n1)
+            test -n "$V"
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$V" > /dev/null
+          done
+          V=$(sed -n 's/^\s*ndkVersion\s*=\s*"\(.*\)"/\1/p' android-awt/build.gradle.kts)
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$V" >> "$GITHUB_ENV"
+
+      - name: Install Rust Android targets
+        if: steps.upstream.outputs.build == 'true'
+        run: rustup target add armv7-linux-androideabi aarch64-linux-android x86_64-linux-android i686-linux-android
+
+      # shaderc takes ~10 minutes to compile; keep it between runs.
+      - name: Cache shaderc
+        if: steps.upstream.outputs.build == 'true'
+        uses: actions/cache@v4
+        with:
+          path: upstream/android/.shaderc
+          key: shaderc-${{ runner.os }}-${{ hashFiles('upstream/android/build.gradle.kts') }}
+          restore-keys: shaderc-${{ runner.os }}-
+
+      # Every build must be signed with the same key, or Android won't install it over the
+      # last one. The key lives in the TOUCHTEST_KEYSTORE_BASE64 secret (a debug keystore,
+      # whose passwords are the standard "android").
+      - name: Configure signing
+        id: signing
+        if: steps.upstream.outputs.build == 'true'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.TOUCHTEST_KEYSTORE_BASE64 }}
+        working-directory: upstream
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::warning::The TOUCHTEST_KEYSTORE_BASE64 secret is not set. The APK is built but not published, because it couldn't install over your current test app."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/touchtest.jks"
+          {
+            echo "runeliteMp.signing.storeFile=$RUNNER_TEMP/touchtest.jks"
+            echo "runeliteMp.signing.storePassword=android"
+            echo "runeliteMp.signing.keyAlias=androiddebugkey"
+            echo "runeliteMp.signing.keyPassword=android"
+          } >> local.properties
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+
+      - name: Build APK
+        if: steps.upstream.outputs.build == 'true'
+        working-directory: upstream
+        run: ./gradlew --no-daemon :android:assembleRelease
+
+      - name: Name APK
+        id: apk
+        if: steps.upstream.outputs.build == 'true'
+        run: |
+          APK=$(find upstream/android/build/outputs/apk/release -name '*.apk' | head -n1)
+          test -n "$APK"
+          NAME="RuneLite-TouchTest_${{ steps.upstream.outputs.tag }}.apk"
+          mv "$APK" "$NAME"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK to the run
+        if: steps.upstream.outputs.build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.apk.outputs.name }}
+          path: ${{ steps.apk.outputs.name }}
+
+      - name: Publish release
+        if: steps.upstream.outputs.build == 'true' && steps.signing.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+          APK: ${{ steps.apk.outputs.name }}
+        run: |
+          if [ "${{ steps.upstream.outputs.exists }}" = "true" ]; then
+            gh release upload "$TAG" "$APK" -R "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" "$APK" -R "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "RuneLite Touch Test $TAG" \
+              --notes "RuneLite Mobile [$TAG](https://github.com/$UPSTREAM/releases/tag/$TAG) with the patches in \`patches/\` applied: plugin touch claims, and Touch Keys built in. Installs beside the official app as **RuneLite Touch Test**."
+          fi
