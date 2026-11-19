@@ -194,3 +194,19 @@ jobs:
               --title "RuneLite Touch Test $TAG" \
               --notes "RuneLite Mobile [$TAG](https://github.com/$UPSTREAM/releases/tag/$TAG) with the patches in \`patches/\` applied: plugin touch claims, and Touch Keys built in. Installs beside the official app as **RuneLite Touch Test**."
           fi
+
+      - name: Summary
+        if: always()
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
+          BUILD: ${{ steps.upstream.outputs.build }}
+          PUBLISH: ${{ steps.signing.outputs.publish }}
+        run: |
+          {
+            echo "### RuneLite Touch Test $TAG"
+            if [ "$BUILD" != "true" ]; then echo "Already built. Nothing to do."
+            elif [ "${{ job.status }}" != "success" ]; then echo "The build failed. See the steps above."
+            elif [ "$PUBLISH" = "true" ]; then echo "Published: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG"
+            else echo "Built, but not published: the TOUCHTEST_KEYSTORE_BASE64 secret isn't set. The APK is attached to this run."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
